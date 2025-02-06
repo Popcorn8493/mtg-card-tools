@@ -5,8 +5,9 @@ Work in progress, tool needs some work and improvements and I make no guarantee 
 Download and work within the repo zip
 
 Install dependencies with pip:
-pip install pandas
-pip install rapidfuzz
+
+```pip install pandas```
+```pip install rapidfuzz```
 
 You will need TCGPlayer Level 4 seller to benefit from this, and also to download the CSV reference file.
 Go to Pricing tab in TCGplayer seller portal, Export Filtered CSV, Leave options as default but notably leave Export only from Live Inventory unchecked. Rename that CSV to REFERENCE.csv and save next to convert_manabox_to_tcgplayer.py.

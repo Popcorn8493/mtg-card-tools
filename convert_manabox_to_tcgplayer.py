@@ -2,7 +2,6 @@ import csv
 import re
 from tkinter import Tk
 from tkinter.filedialog import askopenfilename
-
 import pandas as pd
 from rapidfuzz import fuzz
 
@@ -26,9 +25,13 @@ CONDITION_MAP = {
     "damaged": "Damaged"
 }
 
+# Set a floor price for tokens (if no valid price is found)
+FLOOR_PRICE = 0.10
+
 # Track cards the user has given up on and confirmed matches.
 given_up_cards = []
 confirmed_matches = {}
+
 
 def is_double_sided_candidate(product_name):
     """
@@ -37,6 +40,36 @@ def is_double_sided_candidate(product_name):
     """
     pn = product_name.lower()
     return '//' in pn or ('double' in pn and 'sided' in pn)
+
+
+def get_market_price(manabox_row, ref_row=None):
+    """
+    Determines a valid market price using multiple candidate fields.
+    Order of precedence:
+      1. Check the reference row candidate fields: "TCG Marketplace Price", "List Price", "Retail Price".
+      2. Then check the CSV row's "Purchase price".
+      3. If none yields a valid (nonzero) price, return the FLOOR_PRICE.
+    """
+    candidate_fields = ["TCG Marketplace Price", "List Price", "Retail Price"]
+    if ref_row:
+        for field in candidate_fields:
+            price = str(ref_row.get(field, "")).strip()
+            try:
+                if price and float(price) > 0:
+                    return price
+            except ValueError:
+                continue
+    # Next, try the CSV row
+    csv_candidate_fields = ["Purchase price"]
+    for field in csv_candidate_fields:
+        price = str(manabox_row.get(field, "")).strip()
+        try:
+            if price and float(price) > 0:
+                return price
+        except ValueError:
+            continue
+    return f"{FLOOR_PRICE:.2f}"
+
 
 def normalize_key(card_name, set_name, condition, number):
     """
@@ -65,6 +98,7 @@ def normalize_key(card_name, set_name, condition, number):
 
     normalized_number = re.sub(r"^[A-Za-z\-]*", "", str(number).strip()) if number else None
     return normalized_card_name, normalized_set_name, normalized_number, condition.lower(), suffix
+
 
 def load_reference_data(reference_csv):
     """
@@ -97,9 +131,11 @@ def load_reference_data(reference_csv):
             if key:
                 reference_data[key] = row.to_dict()
 
-        prerelease_in_dict = [k for k in reference_data.keys() if "prerelease" in reference_data[k]["Product Name"].lower()]
+        prerelease_in_dict = [k for k in reference_data.keys() if
+                              "prerelease" in reference_data[k]["Product Name"].lower()]
         if prerelease_in_dict:
-            print(f"Warning: {len(prerelease_in_dict)} prerelease entries remain in reference_data. Investigate keys: {prerelease_in_dict[:5]}")
+            print(
+                f"Warning: {len(prerelease_in_dict)} prerelease entries remain in reference_data. Investigate keys: {prerelease_in_dict[:5]}")
         else:
             print("No prerelease entries remain in reference_data.")
 
@@ -107,6 +143,7 @@ def load_reference_data(reference_csv):
     except FileNotFoundError:
         print(f"Reference file {reference_csv} not found. Exiting.")
         exit()
+
 
 def find_best_match(normalized_key, reference_data):
     """
@@ -125,24 +162,29 @@ def find_best_match(normalized_key, reference_data):
             base_score -= 30
         if normalized_key[3] != ref_key[3]:
             base_score -= 20
-        if "prerelease" in reference_data[ref_key]["Product Name"].lower() or "prerelease cards" in reference_data[ref_key]["Set Name"].lower():
+        if "prerelease" in reference_data[ref_key]["Product Name"].lower() or "prerelease cards" in \
+                reference_data[ref_key]["Set Name"].lower():
             continue
         matches.append((ref_key, base_score))
     matches.sort(key=lambda x: x[1], reverse=True)
     return matches
 
+
 def confirm_and_iterate_match(normalized_key, matches, reference_data):
     """
     Iterate through fuzzy-matched candidates until one is confirmed.
     """
-    print(f"Attempting to match card: {normalized_key[0]} from set {normalized_key[1]} with number {normalized_key[2]}.")
+    print(
+        f"Attempting to match card: {normalized_key[0]} from set {normalized_key[1]} with number {normalized_key[2]}.")
     for i, (match, adjusted_score) in enumerate(matches, start=1):
         ref_row = reference_data.get(match, {})
         if adjusted_score >= 300:
-            print(f"Automatically confirming: {ref_row.get('Product Name', 'Unknown')} | Set: {ref_row.get('Set Name', 'Unknown')} | Card Number: {ref_row.get('Number', 'Unknown')} | Adjusted Score: {adjusted_score}")
+            print(
+                f"Automatically confirming: {ref_row.get('Product Name', 'Unknown')} | Set: {ref_row.get('Set Name', 'Unknown')} | Card Number: {ref_row.get('Number', 'Unknown')} | Adjusted Score: {adjusted_score}")
             confirmed_matches[normalized_key] = match
             return match
-        print(f"Potential match {i}: {ref_row.get('Product Name', 'Unknown')} | Set: {ref_row.get('Set Name', 'Unknown')} | Card Number: {ref_row.get('Number', 'Unknown')} | Adjusted Score: {adjusted_score}")
+        print(
+            f"Potential match {i}: {ref_row.get('Product Name', 'Unknown')} | Set: {ref_row.get('Set Name', 'Unknown')} | Card Number: {ref_row.get('Number', 'Unknown')} | Adjusted Score: {adjusted_score}")
         response = input("Is this correct? (y/n/g): ").strip().lower()
         if response == "y":
             confirmed_matches[normalized_key] = match
@@ -153,13 +195,16 @@ def confirm_and_iterate_match(normalized_key, matches, reference_data):
     print("No match confirmed.")
     return None
 
+
 def map_fields(manabox_row, reference_data):
     """
     Converts a row from the Manabox CSV into the TCGPlayer staged inventory format.
     Handles tokens specially. If the set name contains "Tokens" or the set code begins with 'T'
     (e.g. "TMOM"), then the row is treated as a token.
-    If the CSV does not show two sides (no "//") but the user indicates it is double sided,
+    For tokens, if the CSV does not show two sides (no "//") but the user indicates it is double sided,
     candidate double-sided entries are sought from reference data regardless of which side was scanned.
+    The market price is determined by trying candidate fields from the reference row, then CSV,
+    and finally falling back to a floor price.
     """
     card_name = manabox_row.get("Name", "").strip()
     set_name = manabox_row.get("Set name", "").strip()
@@ -183,7 +228,7 @@ def map_fields(manabox_row, reference_data):
         else:
             token_set_name = set_name
 
-        # For more-flexible matching on set names, derive a base name by removing " tokens"
+        # For more-flexible matching on set names, derive a base by removing " tokens"
         token_set_base = token_set_name.lower().replace(" tokens", "")
         card_number = manabox_row.get("Collector number", "").strip()
 
@@ -203,36 +248,38 @@ def map_fields(manabox_row, reference_data):
 
         # Restrict reference data to token entries.
         token_reference_data = {k: v for k, v in reference_data.items()
-                                if (("token" in v.get("Set Name", "").lower() or "token" in v.get("Product Name", "").lower())
-                                    and (token_set_name.lower() in v.get("Set Name", "").lower() or token_set_base in v.get("Set Name", "").lower()))}
+                                if (("token" in v.get("Set Name", "").lower() or "token" in v.get("Product Name",
+                                                                                                  "").lower())
+                                    and (token_set_name.lower() in v.get("Set Name",
+                                                                         "").lower() or token_set_base in v.get(
+                        "Set Name", "").lower()))}
 
         # Find candidate matches via fuzzy matching.
         matches = find_best_match(normalized_token_key[:4], token_reference_data)
         chosen_match = None
 
         # DOUBLE-SIDED TOKEN HANDLING:
-        # If the CSV row does NOT include "//", ask if the token is double sided.
         if "//" not in card_name:
-            ds_response = input(f"Token '{card_name}' from set '{set_name}' does not indicate two sides. Is it a double sided token? (y/n): ").strip().lower()
+            ds_response = input(
+                f"Token '{card_name}' from set '{set_name}' does not indicate two sides. Is it a double sided token? (y/n): ").strip().lower()
             if ds_response == "y":
-                # Build candidate list from all token_reference_data entries whose product names appear double sided.
                 ds_candidates = []
                 scanned_lower = card_name.lower()
                 for k, v in token_reference_data.items():
                     prod_name = v.get("Product Name", "")
                     if is_double_sided_candidate(prod_name):
-                        # Split candidate on '//', clean each side.
                         sides = prod_name.split("//")
                         sides = [re.sub(r"doubled?-sided token", "", s, flags=re.IGNORECASE).strip() for s in sides]
-                        # If the scanned token appears in any side (either as substring or with a fuzzy ratio above 70), add candidate.
-                        if any(scanned_lower in side.lower() for side in sides) or any(fuzz.ratio(scanned_lower, side.lower()) > 70 for side in sides):
+                        if any(scanned_lower in side.lower() for side in sides) or any(
+                                fuzz.ratio(scanned_lower, side.lower()) > 70 for side in sides):
                             scores = [fuzz.ratio(scanned_lower, side.lower()) for side in sides]
                             ds_candidates.append((k, max(scores)))
                 if ds_candidates:
                     ds_candidates.sort(key=lambda x: x[1], reverse=True)
                     for candidate_key, score in ds_candidates:
                         candidate = token_reference_data[candidate_key]
-                        resp = input(f"Is the double sided token candidate '{candidate.get('Product Name')}' (score {score}) correct? (y/n/g): ").strip().lower()
+                        resp = input(
+                            f"Is the double sided token candidate '{candidate.get('Product Name')}' (score {score}) correct? (y/n/g): ").strip().lower()
                         if resp == "y":
                             chosen_match = candidate_key
                             break
@@ -242,17 +289,16 @@ def map_fields(manabox_row, reference_data):
                 else:
                     print("No double sided candidate entries found in reference data.")
             else:
-                # If not double sided, use the best fuzzy match candidate (if score >= 250).
                 if matches:
                     best_match, best_score = matches[0]
                     if best_score >= 250:
                         chosen_match = best_match
         else:
-            # If the CSV row already shows two sides, iterate through candidates that appear double sided.
             for m, s in matches:
                 candidate = token_reference_data[m]
                 if is_double_sided_candidate(candidate.get("Product Name", "")):
-                    resp = input(f"Double sided token candidate: '{candidate.get('Product Name')}' (score {s}). Is this correct? (y/n/g): ").strip().lower()
+                    resp = input(
+                        f"Double sided token candidate: '{candidate.get('Product Name')}' (score {s}). Is this correct? (y/n/g): ").strip().lower()
                     if resp == "y":
                         chosen_match = m
                         break
@@ -264,6 +310,7 @@ def map_fields(manabox_row, reference_data):
             ref_row = token_reference_data[chosen_match]
             token_product_name = ref_row.get("Product Name", token_product_name)
             token_number = ref_row.get("Number", card_number)
+            market_price = get_market_price(manabox_row, ref_row)
             return {
                 "TCGplayer Id": ref_row.get("TCGplayer Id", "Not Found"),
                 "Product Line": ref_row.get("Product Line", "Magic: The Gathering"),
@@ -273,9 +320,10 @@ def map_fields(manabox_row, reference_data):
                 "Rarity": ref_row.get("Rarity", "Token"),
                 "Condition": condition,
                 "Add to Quantity": int(manabox_row.get("Quantity", "1")),
-                "TCG Marketplace Price": manabox_row.get("Purchase price", "0.00")
+                "TCG Marketplace Price": market_price
             }
-        # Fallback: if no candidate is chosen, build a generic token entry with no id.
+        # Fallback: if no candidate is chosen, build a generic token entry using CSV values.
+        fallback_price = get_market_price(manabox_row, None)
         return {
             "TCGplayer Id": "Not Found",
             "Product Line": "Magic: The Gathering",
@@ -285,7 +333,7 @@ def map_fields(manabox_row, reference_data):
             "Rarity": "Token",
             "Condition": condition,
             "Add to Quantity": int(manabox_row.get("Quantity", "1")),
-            "TCG Marketplace Price": manabox_row.get("Purchase price", "0.00")
+            "TCG Marketplace Price": fallback_price
         }
 
     # STANDARD (NON-TOKEN) PROCESSING:
@@ -329,8 +377,10 @@ def map_fields(manabox_row, reference_data):
                 "Add to Quantity": int(manabox_row.get("Quantity", "1")),
                 "TCG Marketplace Price": manabox_row.get("Purchase price", "0.00")
             }
-    print(f"No match found for card: {normalized_result[0]} from set {normalized_result[1]} with number {normalized_result[2]}.")
+    print(
+        f"No match found for card: {normalized_result[0]} from set {normalized_result[1]} with number {normalized_result[2]}.")
     return None
+
 
 def merge_entries(cards):
     """
@@ -345,6 +395,7 @@ def merge_entries(cards):
             merged[key] = card
     return list(merged.values())
 
+
 def auto_confirm_high_score(cards):
     """
     Automatically confirm cards with a score of 250 or higher.
@@ -354,6 +405,7 @@ def auto_confirm_high_score(cards):
         if card.get('Score', 0) >= 250:
             confirmed.append(card)
     return confirmed
+
 
 # Main file I/O
 Tk().withdraw()  # Hide the root window
@@ -369,7 +421,7 @@ reference_data = load_reference_data(reference_csv)
 
 try:
     with open(manabox_csv, mode='r', newline='', encoding='utf-8') as infile, \
-         open(tcgplayer_csv, mode='w', newline='', encoding='utf-8') as outfile:
+            open(tcgplayer_csv, mode='w', newline='', encoding='utf-8') as outfile:
         reader = csv.DictReader(infile)
         fieldnames = ["TCGplayer Id", "Product Line", "Set Name", "Product Name", "Number", "Rarity",
                       "Condition", "Add to Quantity", "TCG Marketplace Price"]

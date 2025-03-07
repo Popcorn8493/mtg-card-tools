@@ -1,14 +1,12 @@
 import csv
 import re
-from tkinter import Tk
+from tkinter import Tk, Toplevel, Listbox, Button, Label, Frame, messagebox, END
 from tkinter.filedialog import askopenfilename
 import pandas as pd
 from rapidfuzz import fuzz
 
 # Option to filter out prerelease cards
 FILTER_PRERELEASE = True  # Exclude prerelease cards
-PRERELEASE_PENALTY = -20
-EXACT_MATCH_BOOST = 200
 
 # Alias mappings for sets (if needed)
 SET_ALIAS = {
@@ -17,18 +15,28 @@ SET_ALIAS = {
     "the list": "The List"
 }
 
+# Updated condition mapping (ensure underscores become spaces)
 CONDITION_MAP = {
-    "near_mint": "Near Mint",
-    "lightly_played": "Lightly Played",
-    "moderately_played": "Moderately Played",
-    "heavily_played": "Heavily Played",
+    "near mint": "Near Mint",
+    "lightly played": "Lightly Played",
+    "moderately played": "Moderately Played",
+    "heavily played": "Heavily Played",
     "damaged": "Damaged"
+}
+
+# Mapping to rank conditions (lower is better)
+condition_rank = {
+    "near mint": 0,
+    "lightly played": 1,
+    "moderately played": 2,
+    "heavily played": 3,
+    "damaged": 4
 }
 
 # Set a floor price for tokens (if no valid price is found)
 FLOOR_PRICE = 0.10
 
-# Track cards the user has given up on and confirmed matches.
+# Global lists to track confirmed matches and given-up cards.
 given_up_cards = []
 confirmed_matches = {}
 
@@ -40,7 +48,7 @@ def is_double_sided_candidate(product_name):
 
 
 def get_market_price(manabox_row, ref_row=None):
-    """Determines a valid market price using multiple candidate fields."""
+    """Determine a valid market price using multiple candidate fields."""
     candidate_fields = ["TCG Marketplace Price", "List Price", "Retail Price"]
     if ref_row:
         for field in candidate_fields:
@@ -66,9 +74,10 @@ def normalize_key(card_name, set_name, condition, number):
     suffix = ""
     if "(" in card_name and ")" in card_name:
         card_name = re.sub(r"\(.*?\)", "", card_name).strip()
-    # Use only text before '//' (if present)
+    # Use only text before '//' if present.
     card_name = card_name.split('//')[0].strip()
     normalized_card_name = re.sub(r"[^a-zA-Z0-9 ,'-]", "", card_name).strip().lower()
+    # Append "foil" if condition implies it.
     if "foil" in condition.lower():
         normalized_card_name += " foil"
     normalized_set_name = re.sub(r"[^a-zA-Z0-9 ]", "", set_name).strip().lower()
@@ -78,8 +87,26 @@ def normalize_key(card_name, set_name, condition, number):
         return None
     if normalized_set_name == "the list":
         number = number.split("-")[-1] if number else ""
-    normalized_number = re.sub(r"^[A-Za-z\-]*", "", str(number).strip()) if number else None
+    # Remove non-digit (and non-dash) characters (e.g. stars) from number.
+    normalized_number = re.sub(r"[^\d\-]", "", str(number).strip()) if number else None
+    if normalized_number == "":
+        normalized_number = None
     return normalized_card_name, normalized_set_name, normalized_number, condition.lower(), suffix
+
+
+def build_given_up_entry(manabox_row, condition, card_name, set_name):
+    """Build a fallback entry (in TCGplayer format) for cards that were given up on."""
+    return {
+        "TCGplayer Id": "Not Found",
+        "Product Line": "Magic: The Gathering",
+        "Set Name": set_name,
+        "Product Name": card_name,
+        "Number": manabox_row.get("Collector number", "").strip(),
+        "Rarity": manabox_row.get("Rarity", ""),
+        "Condition": condition,
+        "Add to Quantity": int(manabox_row.get("Quantity", "1")),
+        "TCG Marketplace Price": get_market_price(manabox_row, None)
+    }
 
 
 def load_reference_data(reference_csv):
@@ -120,54 +147,171 @@ def load_reference_data(reference_csv):
 
 
 def find_best_match(normalized_key, ref_data):
-    """Find the best match for the given key in reference data using fuzzy matching."""
+    """Find the best match for the given key in reference data using fuzzy matching.
+
+    Suggestions for further improvement:
+      - Experiment with other RapidFuzz metrics (e.g., token_sort_ratio, token_set_ratio).
+      - Use a weighted combination of multiple similarity scores.
+      - Incorporate additional fields (like rarity or product line) into the match.
+    """
     matches = []
     for ref_key in ref_data.keys():
+        # Skip if names don't start with the same letter.
+        if normalized_key[0] and ref_key[0] and normalized_key[0][0] != ref_key[0][0]:
+            continue
+
+        # For single-word names, require an exact match.
+        query_words = normalized_key[0].split()
+        candidate_words = ref_key[0].split()
+        if len(query_words) == 1 and len(candidate_words) == 1:
+            if query_words[0] != candidate_words[0]:
+                continue
+        # For multi-word names, require at least one common word.
+        elif len(query_words) > 1 and len(candidate_words) > 1:
+            if not set(query_words).intersection(set(candidate_words)):
+                continue
+
         base_score = fuzz.ratio(normalized_key[0], ref_key[0])
+        # Bonus if one name is a substring of the other.
+        if normalized_key[0] in ref_key[0] or ref_key[0] in normalized_key[0]:
+            base_score += 20
+
+        # Matching set names.
         if normalized_key[1] == ref_key[1]:
             base_score += 50
-        if normalized_key[2] == ref_key[2] or not normalized_key[2]:
-            base_score += 100
-        if normalized_key[3] == ref_key[3]:
+
+        # Adjust matching for card numbers.
+        if not normalized_key[2] or not ref_key[2]:
             base_score += 50
-        if normalized_key[2] and normalized_key[2] != ref_key[2]:
-            base_score -= 30
-        if normalized_key[3] != ref_key[3]:
-            base_score -= 20
+        elif normalized_key[2] == ref_key[2]:
+            base_score += 100
+        else:
+            base_score -= 15
+
+        # Compare conditions using condition_rank.
+        cond1 = normalized_key[3].replace("foil", "").strip()
+        cond2 = ref_key[3].replace("foil", "").strip()
+        if cond1 in condition_rank and cond2 in condition_rank:
+            diff = abs(condition_rank[cond1] - condition_rank[cond2])
+            if diff == 0:
+                base_score += 50
+            elif diff == 1:
+                base_score -= 10
+            else:
+                base_score -= 30
+        else:
+            if normalized_key[3] != ref_key[3]:
+                base_score -= 20
+
+        # Exclude prerelease entries.
         if "prerelease" in ref_data[ref_key]["Product Name"].lower() or "prerelease cards" in ref_data[ref_key][
             "Set Name"].lower():
             continue
+
         matches.append((ref_key, base_score))
     matches.sort(key=lambda x: x[1], reverse=True)
     return matches
 
 
-def confirm_and_iterate_match(normalized_key, matches, ref_data):
-    """Iterate through fuzzy-matched candidates until one is confirmed."""
-    print(
-        f"Attempting to match card: {normalized_key[0]} from set {normalized_key[1]} with number {normalized_key[2]}.")
-    for i, (match, score) in enumerate(matches, start=1):
+def confirm_match_gui(normalized_key, matches, ref_data, title="Select Correct Card"):
+    """
+    Opens a centered GUI window for candidate selection.
+    Each candidate string shows:
+      - Product Name, Set, Number, Candidate Condition, and Score.
+      - Also displays the input condition.
+    The first candidate is auto-selected. 
+    Returns the selected match key or None if the user gives up.
+    """
+    root = Tk()
+    root.withdraw()  # Hide main window
+    window = Toplevel(root)
+    window.title(title)
+
+    instruction = (f"Select the correct match for:\n'{normalized_key[0]}' from set '{normalized_key[1]}' "
+                   f"(Number: {normalized_key[2]})\nInput Condition: {normalized_key[3]}")
+    Label(window, text=instruction, padx=10, pady=10).pack()
+
+    listbox = Listbox(window, width=120, height=10)
+    listbox.pack(padx=10, pady=5)
+
+    candidate_options = []
+    for idx, (match, score) in enumerate(matches):
         candidate = ref_data.get(match, {})
-        if score >= 300:
-            print(
-                f"Automatically confirming: {candidate.get('Product Name', 'Unknown')} | Set: {candidate.get('Set Name', 'Unknown')} | Card Number: {candidate.get('Number', 'Unknown')} | Adjusted Score: {score}")
-            confirmed_matches[normalized_key] = match
-            return match
-        print(
-            f"Potential match {i}: {candidate.get('Product Name', 'Unknown')} | Set: {candidate.get('Set Name', 'Unknown')} | Card Number: {candidate.get('Number', 'Unknown')} | Adjusted Score: {score}")
-        response = input("Is this correct? (y/n/g): ").strip().lower()
-        if response == "y":
-            confirmed_matches[normalized_key] = match
-            return match
-        elif response == "g":
-            given_up_cards.append({"Name": normalized_key[0], "Set": normalized_key[1], "Number": normalized_key[2]})
-            return None
-    print("No match confirmed.")
-    return None
+        candidate_condition = candidate.get("Condition", "Unknown")
+        candidate_str = (f"{idx + 1}: {candidate.get('Product Name', 'Unknown')} | "
+                         f"Set: {candidate.get('Set Name', 'Unknown')} | "
+                         f"Number: {candidate.get('Number', 'Unknown')} | "
+                         f"Candidate Condition: {candidate_condition} | "
+                         f"Score: {score}")
+        listbox.insert(END, candidate_str)
+        candidate_options.append(match)
+
+    if candidate_options:
+        listbox.selection_set(0)
+
+    selection = {"choice": None}
+
+    def on_confirm():
+        selected_indices = listbox.curselection()
+        if selected_indices:
+            selection["choice"] = candidate_options[selected_indices[0]]
+            window.destroy()
+
+    def on_giveup():
+        selection["choice"] = "giveup"
+        window.destroy()
+
+    button_frame = Frame(window)
+    button_frame.pack(pady=10)
+
+    confirm_button = Button(button_frame, text="Confirm Selection", command=on_confirm)
+    confirm_button.pack(side="left", padx=5)
+
+    giveup_button = Button(button_frame, text="Give Up", command=on_giveup)
+    giveup_button.pack(side="left", padx=5)
+
+    # Center the window.
+    window.update_idletasks()
+    w = window.winfo_width()
+    h = window.winfo_height()
+    ws = window.winfo_screenwidth()
+    hs = window.winfo_screenheight()
+    x = (ws // 2) - (w // 2)
+    y = (hs // 2) - (h // 2)
+    window.geometry(f"+{x}+{y}")
+
+    window.protocol("WM_DELETE_WINDOW", on_giveup)
+    window.wait_window()  # Wait until window is destroyed
+    root.destroy()
+
+    if selection["choice"] == "giveup":
+        print(f"User gave up on matching card: {normalized_key[0]} from set {normalized_key[1]}")
+        return None
+    else:
+        return selection["choice"]
+
+
+def confirm_and_iterate_match(normalized_key, matches, ref_data):
+    """
+    If the best match score is high enough, auto-confirm it (logging the candidate condition).
+    Otherwise, open the GUI for selection.
+    """
+    print(f"Matching card: {normalized_key[0]} from set {normalized_key[1]} (Number: {normalized_key[2]})")
+    best_match, best_score = matches[0]
+    candidate = ref_data.get(best_match, {})
+    if best_score >= 300:
+        print(f"Auto-confirming high score match: {candidate.get('Product Name', 'Unknown')} | "
+              f"Candidate Condition: {candidate.get('Condition', 'Unknown')}")
+        confirmed_matches[normalized_key] = best_match
+        return best_match
+    chosen_match = confirm_match_gui(normalized_key, matches, ref_data)
+    if chosen_match:
+        confirmed_matches[normalized_key] = chosen_match
+    return chosen_match
 
 
 def build_standard_entry(ref_row, product_name_suffix, manabox_row, condition):
-    """Helper to build a standard entry dictionary."""
+    """Build a standard entry dictionary in TCGplayer format."""
     return {
         "TCGplayer Id": ref_row.get("TCGplayer Id", "Not Found"),
         "Product Line": ref_row.get("Product Line", "Magic: The Gathering"),
@@ -182,7 +326,7 @@ def build_standard_entry(ref_row, product_name_suffix, manabox_row, condition):
 
 
 def build_token_entry(ref_row, token_set_name, token_product_name, token_number, manabox_row, condition):
-    """Helper to build a token entry dictionary from a confirmed match."""
+    """Build a token entry dictionary from a confirmed match."""
     return {
         "TCGplayer Id": ref_row.get("TCGplayer Id", "Not Found"),
         "Product Line": ref_row.get("Product Line", "Magic: The Gathering"),
@@ -197,7 +341,7 @@ def build_token_entry(ref_row, token_set_name, token_product_name, token_number,
 
 
 def build_token_fallback(token_set_name, token_product_name, card_number, manabox_row, condition):
-    """Helper to build a fallback token entry dictionary when no match is found."""
+    """Build a fallback token entry dictionary when no match is found."""
     fallback_price = get_market_price(manabox_row, None)
     return {
         "TCGplayer Id": "Not Found",
@@ -213,7 +357,9 @@ def build_token_fallback(token_set_name, token_product_name, card_number, manabo
 
 
 def process_standard(manabox_row, ref_data, condition, card_name, set_name):
-    """Process non-token (standard) card rows."""
+    """Process a standard (non-token) card row.
+       If matching fails or the user gives up, record the card into given_up_cards.
+    """
     card_number = re.sub(r"^[A-Za-z\-]*", "", manabox_row.get("Collector number", "").strip().split("-")[-1])
     if not card_name or not set_name:
         return None
@@ -226,19 +372,23 @@ def process_standard(manabox_row, ref_data, condition, card_name, set_name):
         ref_row = ref_data[confirmed_matches[key]]
         return build_standard_entry(ref_row, normalized_result[4], manabox_row, condition)
     matches = find_best_match(key, ref_data)
+    confirmed_match = None
     if matches:
         confirmed_match = confirm_and_iterate_match(key, matches, ref_data)
-        if confirmed_match:
-            ref_row = ref_data[confirmed_match]
-            return build_standard_entry(ref_row, normalized_result[4], manabox_row, condition)
-    print(
-        f"No match found for card: {normalized_result[0]} from set {normalized_result[1]} with number {normalized_result[2]}.")
-    return None
+    if confirmed_match:
+        ref_row = ref_data[confirmed_match]
+        return build_standard_entry(ref_row, normalized_result[4], manabox_row, condition)
+    else:
+        fallback = build_given_up_entry(manabox_row, condition, card_name, set_name)
+        given_up_cards.append(fallback)
+        print(f"User gave up on matching card: {normalized_result[0]} from set {normalized_result[1]}")
+        return None
 
 
 def process_token(manabox_row, ref_data, condition, card_name, set_name):
-    """Process token card rows."""
-    # Determine canonical token set name.
+    """Process a token card row.
+       If matching fails or the user gives up, record the card into given_up_cards.
+    """
     if set_name.startswith("T") and re.match(r"^T[A-Z0-9]+$", set_name):
         token_set_name = set_name[1:] + " tokens"
     else:
@@ -264,10 +414,11 @@ def process_token(manabox_row, ref_data, condition, card_name, set_name):
                     "Set Name", "").lower()))}
     matches = find_best_match(normalized_token_key[:4], token_ref_data)
     chosen_match = None
+
     if "//" not in card_name:
-        ds_response = input(
-            f"Token '{card_name}' from set '{set_name}' does not indicate two sides. Is it a double sided token? (y/n): ").strip().lower()
-        if ds_response == "y":
+        is_ds = messagebox.askyesno("Double Sided Token",
+                                    f"Token '{card_name}' from set '{set_name}' does not indicate two sides. Is it a double sided token?")
+        if is_ds:
             ds_candidates = []
             scanned_lower = card_name.lower()
             for k, v in token_ref_data.items():
@@ -281,61 +432,49 @@ def process_token(manabox_row, ref_data, condition, card_name, set_name):
                         ds_candidates.append((k, max(scores)))
             if ds_candidates:
                 ds_candidates.sort(key=lambda x: x[1], reverse=True)
-                for candidate_key, score in ds_candidates:
-                    candidate = token_ref_data[candidate_key]
-                    resp = input(
-                        f"Is the double sided token candidate '{candidate.get('Product Name')}' (score {score}) correct? (y/n/g): ").strip().lower()
-                    if resp == "y":
-                        chosen_match = candidate_key
-                        break
-                    elif resp == "g":
-                        chosen_match = None
-                        break
+                chosen_match = confirm_match_gui(normalized_token_key, ds_candidates, token_ref_data,
+                                                 title="Select Double Sided Token")
             else:
-                print("No double sided candidate entries found in reference data.")
+                messagebox.showinfo("Info", "No double sided candidate entries found in reference data.")
         else:
             if matches:
                 best_match, best_score = matches[0]
                 if best_score >= 250:
                     chosen_match = best_match
+                else:
+                    chosen_match = confirm_match_gui(normalized_token_key, matches, token_ref_data,
+                                                     title="Select Token Match")
     else:
-        for m, s in matches:
-            candidate = token_ref_data[m]
-            if is_double_sided_candidate(candidate.get("Product Name", "")):
-                resp = input(
-                    f"Double sided token candidate: '{candidate.get('Product Name')}' (score {s}). Is this correct? (y/n/g): ").strip().lower()
-                if resp == "y":
-                    chosen_match = m
-                    break
-                elif resp == "g":
-                    chosen_match = None
-                    break
+        ds_matches = [(m, s) for m, s in matches if
+                      is_double_sided_candidate(token_ref_data[m].get("Product Name", ""))]
+        if ds_matches:
+            chosen_match = confirm_match_gui(normalized_token_key, ds_matches, token_ref_data,
+                                             title="Select Double Sided Token")
 
     if chosen_match:
         ref_row = token_ref_data[chosen_match]
         token_product_name = ref_row.get("Product Name", token_product_name)
         token_number = ref_row.get("Number", card_number)
         return build_token_entry(ref_row, token_set_name, token_product_name, token_number, manabox_row, condition)
-    return build_token_fallback(token_set_name, token_product_name, card_number, manabox_row, condition)
+    else:
+        fallback = build_token_fallback(token_set_name, token_product_name, card_number, manabox_row, condition)
+        given_up_cards.append(fallback)
+        print(f"User gave up on matching token: {card_name} from set {set_name}")
+        return None
 
 
 def map_fields(manabox_row, ref_data):
-    """Converts a row from the Manabox CSV into the TCGPlayer staged inventory format."""
+    """Convert a row from the Manabox CSV into the TCGPlayer staged inventory format."""
     card_name = manabox_row.get("Name", "").strip()
     set_name = manabox_row.get("Set name", "").strip()
-    condition_code = manabox_row.get("Condition", "near_mint").strip().lower()
+    condition_code = manabox_row.get("Condition", "near mint").strip().lower().replace("_", " ")
     foil = "Foil" if manabox_row.get("Foil", "normal").lower() == "foil" else ""
     condition = CONDITION_MAP.get(condition_code, "Near Mint")
     if foil:
         condition += " Foil"
 
-    # Decide if this row is a token or a standard card.
-    is_token = False
-    if "token" in set_name.lower() or "token" in card_name.lower():
-        is_token = True
-    elif set_name.startswith("T") and re.match(r"^T[A-Z0-9]+$", set_name):
-        is_token = True
-
+    is_token = ("token" in set_name.lower() or "token" in card_name.lower() or
+                (set_name.startswith("T") and re.match(r"^T[A-Z0-9]+$", set_name)))
     if is_token:
         return process_token(manabox_row, ref_data, condition, card_name, set_name)
     else:
@@ -364,7 +503,7 @@ def auto_confirm_high_score(cards):
 
 
 def select_csv_file(prompt):
-    """Helper function to open a file dialog with a given prompt and return the file path."""
+    """Open a file dialog with a given prompt and return the file path."""
     file_path = askopenfilename(title=prompt, filetypes=[("CSV Files", "*.csv")])
     if not file_path:
         print(f"No file selected for {prompt}. Exiting.")
@@ -397,10 +536,15 @@ try:
         for card in merged_cards:
             writer.writerow(card)
     print("Conversion complete. Output saved to tcgplayer_staged.csv")
+    # If there are given-up cards, output them to a separate CSV.
     if given_up_cards:
-        print("Cards given up on:")
-        for card in given_up_cards:
-            print(f"Name: {card['Name']}, Set: {card['Set']}, Number: {card['Number']}")
+        given_up_csv = "tcgplayer_given_up.csv"
+        with open(given_up_csv, mode='w', newline='', encoding='utf-8') as gfile:
+            gwriter = csv.DictWriter(gfile, fieldnames=fieldnames)
+            gwriter.writeheader()
+            for entry in given_up_cards:
+                gwriter.writerow(entry)
+        print(f"Given up cards saved to {given_up_csv}")
 except FileNotFoundError as e:
     print(f"Error: {e}")
 except Exception as e:

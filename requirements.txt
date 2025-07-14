@@ -1,0 +1,14 @@
+pip
+wheel
+pytz
+numpy
+charset-normalizer
+setuptools
+pandas
+python-dateutil
+certifi
+urllib3
+six
+idna
+RapidFuzz
+fuzzywuzzy

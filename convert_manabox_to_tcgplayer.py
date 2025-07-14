@@ -536,9 +536,8 @@ def select_csv_file(prompt):
 # Main file I/O
 Tk().withdraw()
 manabox_csv = select_csv_file("Select the Manabox CSV File")
-#reference_csv = select_csv_file("Select the TCGPlayer Reference CSV File")
-reference_csv = "TCGplayer__Pricing_Custom_Export_20250615_111402.csv"
-tcgplayer_csv = "tcgplayer_staged.csv"
+reference_csv = select_csv_file("Select the TCGPlayer Reference CSV File")
+tcgplayer_csv = "tcgplayer_staged_inventory.csv"
 ref_data = load_reference_data(reference_csv)
 
 try:
